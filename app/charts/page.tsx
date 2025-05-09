@@ -13,9 +13,9 @@ const years = [
   "2030",
 ];
 
-// 2023: 输入30，输出60；2024: 输入5，输出15；2025及后用原有预测
-const inputCost = [30, 5, 1.25, 0.3, 0.125, 0.03, null, 0.005];
-const outputCost = [60, 15, 5, 1.25, 0.6, 0.175, null, 0.05];
+// 2023: 输入30，输出60；2024: 输入5，输出15；2025及后用原有预测，2029年补全为0.015和0.1
+const inputCost = [30, 5, 1.25, 0.3, 0.125, 0.03, 0.015, 0.005];
+const outputCost = [60, 15, 5, 1.25, 0.6, 0.175, 0.1, 0.05];
 
 const costOption = {
   title: {
@@ -64,6 +64,24 @@ export default function ChartsPage() {
     <div className="p-8 space-y-8">
       <h1 className="text-2xl font-bold mb-4">折线图演示</h1>
       <ReactECharts option={costOption} style={{ height: 400 }} />
+      <table className="w-full border mt-8 text-center">
+        <thead>
+          <tr className="bg-gray-100">
+            <th className="border px-4 py-2">年份</th>
+            <th className="border px-4 py-2">输入成本（美元/百万token）</th>
+            <th className="border px-4 py-2">输出成本（美元/百万token）</th>
+          </tr>
+        </thead>
+        <tbody>
+          {years.map((year, i) => (
+            <tr key={year}>
+              <td className="border px-4 py-2">{year}</td>
+              <td className="border px-4 py-2">{inputCost[i] !== null ? inputCost[i] : '-'}</td>
+              <td className="border px-4 py-2">{outputCost[i] !== null ? outputCost[i] : '-'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 } 
