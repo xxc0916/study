@@ -20,11 +20,34 @@ type ChatMessage =
   | { id: string; role: 'assistant'; kind: 'text'; text: string }
   | { id: string; role: 'assistant'; kind: 'canvas'; canvas: CanvasPayload };
 
+type TimerFiredMessage = {
+  type: 'timer.fired';
+  firedAt: number;
+  timer: { task?: { type?: unknown; message?: unknown } };
+};
+
 /**
  * 生成一个尽量稳定的消息 ID，避免 key 变化导致的闪烁。
  */
 function createMessageId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `msg_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * 从 WS 事件中解析出 notify 文本（用于在聊天区域显示）。
+ */
+function extractNotifyTextFromTimerEvent(event: unknown): string | null {
+  if (!event || typeof event !== 'object') return null;
+  const type = (event as { type?: unknown }).type;
+  if (type !== 'timer.fired') return null;
+
+  const timer = (event as TimerFiredMessage).timer;
+  const task = timer?.task;
+  if (!task || typeof task !== 'object') return null;
+  if ((task as { type?: unknown }).type !== 'notify') return null;
+  const message = (task as { message?: unknown }).message;
+  if (typeof message !== 'string' || !message.trim()) return null;
+  return message.trim();
 }
 
 /**
@@ -189,6 +212,52 @@ export default function Page() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
+
+  /**
+   * 订阅定时器 WS 推送，把 notify 事件追加为 assistant 文本消息。
+   */
+  useEffect(() => {
+    const wsUrl = 'ws://localhost:3001/ws';
+    let ws: WebSocket | null = null;
+    let stopped = false;
+    let retryTimer: number | null = null;
+
+    const connect = () => {
+      if (stopped) return;
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (e) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(String(e.data));
+        } catch {
+          return;
+        }
+
+        const text = extractNotifyTextFromTimerEvent(parsed);
+        if (!text) return;
+        setMessages((prev) => [...prev, { id: createMessageId(), role: 'assistant', kind: 'text', text }]);
+      };
+
+      ws.onclose = () => {
+        if (stopped) return;
+        retryTimer = window.setTimeout(connect, 1500);
+      };
+
+      ws.onerror = () => {
+        ws?.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      ws?.close();
+      ws = null;
+    };
+  }, []);
 
   /**
    * 发送消息：把历史消息 + 新消息发到服务端，再把模型回复追加到列表里。

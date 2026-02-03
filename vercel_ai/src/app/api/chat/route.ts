@@ -17,6 +17,23 @@ type ChatOutput =
   | { type: 'text'; text: string }
   | { type: 'canvas'; canvas: CanvasPayload };
 
+type TimerTask =
+  | { type: 'notify'; message: string; data?: unknown }
+  | { type: 'log'; message: string; data?: unknown };
+
+type TimerCreateInput =
+  | { mode: 'once'; runAt: number; task: TimerTask }
+  | { mode: 'interval'; everyMs: number; startAt?: number; task: TimerTask };
+
+type TimerAction =
+  | { name: 'timer.create'; timer: TimerCreateInput }
+  | { name: 'timer.cancel'; id: string }
+  | { name: 'timer.list' };
+
+type ActionOutput = { type: 'action'; action: TimerAction; replyText?: string };
+
+type ParsedOutput = ChatOutput | ActionOutput;
+
 /**
  * 从环境变量读取 OpenAI-compatible 网关配置。
  */
@@ -49,6 +66,15 @@ function coerceMessages(input: unknown): ModelMessage[] {
 }
 
 /**
+ * 从环境变量读取 Timer WS 配置。
+ */
+function getTimerWsConfig(): { url: string; timeoutMs: number } {
+  const url = (process.env.TIMER_WS_URL ?? 'ws://localhost:3001/ws').trim();
+  const timeoutMs = Number(process.env.TIMER_WS_TIMEOUT_MS ?? '2000');
+  return { url, timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 2000 };
+}
+
+/**
  * 构建一段 system 指令，让模型在 “纯文本” 与 “Canvas 小应用” 之间自适配输出。
  */
 function buildCanvasSystemPrompt(): string {
@@ -57,11 +83,13 @@ function buildCanvasSystemPrompt(): string {
     '',
     '你必须只输出一个 JSON 对象（不要 Markdown，不要代码块，不要额外文本）。',
     '',
-    '输出格式二选一：',
+    '输出格式三选一：',
     '1) 纯文本：{"type":"text","text":"..."}',
     '2) Canvas：{"type":"canvas","canvas":{"title":"可选标题","html":"...","css":"可选","js":"可选","height":360,"allowNetwork":false}}',
+    '3) 动作（用于创建/管理定时器）：{"type":"action","action":{"name":"timer.create","timer":{"mode":"interval","everyMs":10000,"task":{"type":"notify","message":"你好"}}},"replyText":"可选：给用户的确认文案"}',
     '',
     '何时使用 Canvas：当用户需要数据可视化、筛选/排序、表单提交、缩放/切换视图等交互时，优先用 Canvas；否则用 text。',
+    '何时使用 action：当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先用 action。',
     '',
     'Canvas 约束：',
     '- 生成的 html/css/js 必须自包含，尽量不要依赖外部 CDN/网络请求。',
@@ -69,6 +97,10 @@ function buildCanvasSystemPrompt(): string {
     '- 不要读取/写入 cookies、localStorage、indexedDB；不要尝试访问父窗口 DOM。',
     '- 默认宽度自适应容器；高度建议 320~520（可通过 height 字段给出初始高度）。',
     '- 交互通过原生 HTML 表单/按钮/事件即可。',
+    '',
+    '定时器 action 约束：',
+    '- timer.create：mode=once 需要 runAt（毫秒时间戳）；mode=interval 需要 everyMs（毫秒），可选 startAt。',
+    '- task.type=notify 或 log；message 必须是简短字符串；data 可选。',
     '',
     '如果你无法生成 Canvas（例如缺少数据），请退回输出 type="text" 并说明需要什么输入。'
   ].join('\n');
@@ -94,7 +126,7 @@ function extractJsonObjectText(raw: string): string | null {
 /**
  * 尝试把模型输出解析成 ChatOutput；失败则回退为纯文本。
  */
-function parseChatOutput(raw: string): ChatOutput {
+function parseChatOutput(raw: string): ParsedOutput {
   const candidate = extractJsonObjectText(raw);
   if (!candidate) return { type: 'text', text: raw };
 
@@ -135,9 +167,253 @@ function parseChatOutput(raw: string): ChatOutput {
       };
     }
 
+    if (type === 'action') {
+      const action = (parsed as { action?: unknown }).action;
+      const replyText = (parsed as { replyText?: unknown }).replyText;
+      const normalized = normalizeTimerAction(action);
+      if (!normalized) return { type: 'text', text: raw };
+      return { type: 'action', action: normalized, replyText: typeof replyText === 'string' ? replyText : undefined };
+    }
+
     return { type: 'text', text: raw };
   } catch {
     return { type: 'text', text: raw };
+  }
+}
+
+/**
+ * 将未知输入尽量规范化为 TimerAction。
+ */
+function normalizeTimerAction(input: unknown): TimerAction | null {
+  if (!input || typeof input !== 'object') return null;
+  const name = (input as { name?: unknown }).name;
+  if (name === 'timer.list') return { name: 'timer.list' };
+
+  if (name === 'timer.cancel') {
+    const id = (input as { id?: unknown }).id;
+    if (typeof id !== 'string' || !id) return null;
+    return { name: 'timer.cancel', id };
+  }
+
+  if (name === 'timer.create') {
+    const timer = (input as { timer?: unknown }).timer;
+    const normalized = normalizeTimerCreateInput(timer);
+    if (!normalized) return null;
+    return { name: 'timer.create', timer: normalized };
+  }
+
+  return null;
+}
+
+/**
+ * 将未知输入尽量规范化为 TimerCreateInput。
+ */
+function normalizeTimerCreateInput(input: unknown): TimerCreateInput | null {
+  if (!input || typeof input !== 'object') return null;
+  const mode = (input as { mode?: unknown }).mode;
+  const task = normalizeTimerTask((input as { task?: unknown }).task);
+  if (!task) return null;
+
+  if (mode === 'once') {
+    const runAt = (input as { runAt?: unknown }).runAt;
+    const ts = typeof runAt === 'number' && Number.isFinite(runAt) ? Math.floor(runAt) : null;
+    if (ts === null) return null;
+    return { mode: 'once', runAt: ts, task };
+  }
+
+  if (mode === 'interval') {
+    const everyMs = (input as { everyMs?: unknown }).everyMs;
+    const ms = typeof everyMs === 'number' && Number.isFinite(everyMs) ? Math.max(50, Math.floor(everyMs)) : null;
+    if (ms === null) return null;
+    const startAt = (input as { startAt?: unknown }).startAt;
+    const start =
+      typeof startAt === 'number' && Number.isFinite(startAt) ? Math.floor(startAt) : undefined;
+    return { mode: 'interval', everyMs: ms, startAt: start, task };
+  }
+
+  return null;
+}
+
+/**
+ * 将未知输入尽量规范化为 TimerTask。
+ */
+function normalizeTimerTask(input: unknown): TimerTask | null {
+  if (!input || typeof input !== 'object') return null;
+  const type = (input as { type?: unknown }).type;
+  const message = (input as { message?: unknown }).message;
+  const data = (input as { data?: unknown }).data;
+  if (typeof message !== 'string') return null;
+  if (type === 'log') return { type: 'log', message, data };
+  if (type === 'notify') return { type: 'notify', message, data };
+  return null;
+}
+
+/**
+ * 生成用于关联请求的 requestId。
+ */
+function createRequestId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * 把 requestId 注入到 task.data，便于在 WS 事件流里定位对应创建结果。
+ */
+function withRequestId(task: TimerTask, requestId: string): TimerTask {
+  const original = task.data;
+  if (original && typeof original === 'object' && !Array.isArray(original)) {
+    return { ...task, data: { ...(original as Record<string, unknown>), __requestId: requestId } };
+  }
+  if (original === undefined) return { ...task, data: { __requestId: requestId } };
+  return { ...task, data: { value: original, __requestId: requestId } };
+}
+
+/**
+ * 通过 WS 与定时器服务交互，执行动作并返回可读结果。
+ */
+async function executeTimerAction(action: TimerAction): Promise<{ ok: boolean; text: string }> {
+  const { url, timeoutMs } = getTimerWsConfig();
+  const requestId = createRequestId();
+
+  if (typeof globalThis.WebSocket !== 'function') {
+    return { ok: false, text: '当前服务端运行时不支持 WebSocket 客户端' };
+  }
+
+  const ws = new globalThis.WebSocket(url);
+  const startedAt = Date.now();
+
+  const waitFor = <T>(predicate: (message: unknown) => T | null): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`定时器服务超时（${timeoutMs}ms）`));
+      }, timeoutMs);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.removeEventListener('message', onMessage);
+        ws.removeEventListener('error', onError);
+        ws.removeEventListener('close', onClose);
+      };
+
+      const onMessage = (event: MessageEvent<unknown>) => {
+        const data = (event as MessageEvent<unknown>).data;
+        const text =
+          typeof data === 'string'
+            ? data
+            : data instanceof ArrayBuffer
+              ? Buffer.from(data).toString('utf8')
+              : ArrayBuffer.isView(data)
+                ? Buffer.from(data.buffer).toString('utf8')
+                : String(data);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return;
+        }
+
+        const match = predicate(parsed);
+        if (match) {
+          cleanup();
+          resolve(match);
+        }
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error('定时器服务连接错误'));
+      };
+
+      const onClose = () => {
+        cleanup();
+        reject(new Error('定时器服务连接已关闭'));
+      };
+
+      ws.addEventListener('message', onMessage);
+      ws.addEventListener('error', onError);
+      ws.addEventListener('close', onClose);
+    });
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`连接定时器服务超时（${timeoutMs}ms）`)), timeoutMs);
+    const cleanup = () => {
+      ws.removeEventListener('open', onOpen);
+      ws.removeEventListener('error', onError);
+    };
+
+    const onOpen = () => {
+      clearTimeout(timer);
+      cleanup();
+      resolve();
+    };
+
+    const onError = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error('连接定时器服务失败'));
+    };
+
+    ws.addEventListener('open', onOpen);
+    ws.addEventListener('error', onError);
+  });
+
+  try {
+    if (action.name === 'timer.list') {
+      ws.send(JSON.stringify({ type: 'timer.list' }));
+      const list = await waitFor<{ timers: unknown[] }>((msg) => {
+        if (!msg || typeof msg !== 'object') return null;
+        if ((msg as { type?: unknown }).type !== 'timer.list') return null;
+        const timers = (msg as { timers?: unknown }).timers;
+        return Array.isArray(timers) ? { timers } : null;
+      });
+      return { ok: true, text: `当前定时器数量：${list.timers.length}` };
+    }
+
+    if (action.name === 'timer.cancel') {
+      ws.send(JSON.stringify({ type: 'timer.cancel', id: action.id }));
+      const canceled = await waitFor<{ ok: boolean }>((msg) => {
+        if (!msg || typeof msg !== 'object') return null;
+        if ((msg as { type?: unknown }).type !== 'timer.canceled') return null;
+        if ((msg as { id?: unknown }).id !== action.id) return null;
+        const ok = (msg as { ok?: unknown }).ok;
+        return typeof ok === 'boolean' ? { ok } : null;
+      });
+      return { ok: canceled.ok, text: canceled.ok ? `已取消定时器：${action.id}` : `取消失败：${action.id}` };
+    }
+
+    const timer = action.timer.mode === 'once'
+      ? { ...action.timer, task: withRequestId(action.timer.task, requestId) }
+      : { ...action.timer, task: withRequestId(action.timer.task, requestId) };
+
+    ws.send(JSON.stringify({ type: 'timer.create', timer }));
+
+    const created = await waitFor<{ id: string; message: string; mode: string; everyMs?: number }>((msg) => {
+      if (!msg || typeof msg !== 'object') return null;
+      if ((msg as { type?: unknown }).type !== 'timer.created') return null;
+      const t = (msg as { timer?: unknown }).timer;
+      if (!t || typeof t !== 'object') return null;
+      const task = (t as { task?: unknown }).task;
+      if (!task || typeof task !== 'object') return null;
+      const data = (task as { data?: unknown }).data;
+      const rid = data && typeof data === 'object' ? (data as { __requestId?: unknown }).__requestId : undefined;
+      if (rid !== requestId) return null;
+
+      const id = (t as { id?: unknown }).id;
+      const mode = (t as { mode?: unknown }).mode;
+      const message = (task as { message?: unknown }).message;
+      const everyMs = (t as { everyMs?: unknown }).everyMs;
+      if (typeof id !== 'string' || typeof mode !== 'string' || typeof message !== 'string') return null;
+      return { id, mode, message, everyMs: typeof everyMs === 'number' ? everyMs : undefined };
+    });
+
+    const cost = Date.now() - startedAt;
+    if (created.mode === 'interval') {
+      const ms = created.everyMs ?? (action.timer.mode === 'interval' ? action.timer.everyMs : undefined);
+      return { ok: true, text: `已创建定时器（每隔 ${ms ?? '?'}ms）：${created.message}（id=${created.id}，${cost}ms）` };
+    }
+    return { ok: true, text: `已创建一次性定时器：${created.message}（id=${created.id}，${cost}ms）` };
+  } finally {
+    ws.close();
   }
 }
 
@@ -173,8 +449,16 @@ export async function POST(req: Request): Promise<Response> {
       messages: [{ role: 'system', content: buildCanvasSystemPrompt() }, ...messages]
     });
 
-    const output = parseChatOutput(result.text);
-    return NextResponse.json({ output });
+    const parsed = parseChatOutput(result.text);
+    if (parsed.type === 'action') {
+      const executed = await executeTimerAction(parsed.action);
+      const text = parsed.replyText?.trim()
+        ? `${parsed.replyText.trim()}\n${executed.text}`
+        : executed.text;
+      return NextResponse.json({ output: { type: 'text', text } satisfies ChatOutput });
+    }
+
+    return NextResponse.json({ output: parsed satisfies ChatOutput });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: message }, { status: 500 });
