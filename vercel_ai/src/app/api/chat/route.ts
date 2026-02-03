@@ -1,6 +1,7 @@
 import { generateText, type ModelMessage } from 'ai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { NextResponse } from 'next/server';
+import { addMemory, searchMemories, type MemoryItem } from '../../../server/memoryStore';
 
 export const runtime = 'nodejs';
 
@@ -49,10 +50,12 @@ function getOpenAICompatibleConfig(): { baseURL: string; apiKey: string; model: 
  * 将任意输入尽量标准化为 ModelMessage[]，避免接口参数不符合预期。
  * 为避免客户端注入 system 指令，这里仅接受 user/assistant 两类角色。
  */
-function coerceMessages(input: unknown): ModelMessage[] {
+type SimpleMessage = { role: 'user' | 'assistant'; content: string };
+
+function coerceMessages(input: unknown): SimpleMessage[] {
   if (!Array.isArray(input)) return [{ role: 'user', content: '你好' }];
 
-  const messages: ModelMessage[] = [];
+  const messages: SimpleMessage[] = [];
   for (const item of input) {
     if (!item || typeof item !== 'object') continue;
     const role = (item as { role?: unknown }).role;
@@ -72,6 +75,64 @@ function getTimerWsConfig(): { url: string; timeoutMs: number } {
   const url = (process.env.TIMER_WS_URL ?? 'ws://localhost:3001/ws').trim();
   const timeoutMs = Number(process.env.TIMER_WS_TIMEOUT_MS ?? '2000');
   return { url, timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 2000 };
+}
+
+function buildMemoryContextPrompt(memories: MemoryItem[]): string {
+  if (memories.length === 0) return '';
+  const lines = memories.map((m) => `- ${m.text}`);
+  return ['已知用户长期记忆（可被更新；如冲突请向用户确认）：', ...lines].join('\n');
+}
+
+type MemoryCandidate = { text: string; tags?: string[] };
+
+function parseMemoryCandidates(raw: string): MemoryCandidate[] {
+  const candidate = extractJsonObjectText(raw);
+  if (!candidate) return [];
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    const memories = (parsed as { memories?: unknown }).memories;
+    if (!Array.isArray(memories)) return [];
+    return memories
+      .map((m): MemoryCandidate | null => {
+        if (!m || typeof m !== 'object') return null;
+        const text = (m as { text?: unknown }).text;
+        const tags = (m as { tags?: unknown }).tags;
+        if (typeof text !== 'string' || !text.trim()) return null;
+        return {
+          text: text.trim(),
+          tags: Array.isArray(tags) ? tags.filter((t): t is string => typeof t === 'string') : undefined
+        };
+      })
+      .filter((x): x is MemoryCandidate => Boolean(x));
+  } catch {
+    return [];
+  }
+}
+
+async function autoRememberFromUserText(input: {
+  model: ReturnType<ReturnType<typeof createOpenAICompatible>>;
+  userText: string;
+}): Promise<void> {
+  const text = input.userText.trim();
+  if (!text) return;
+
+  const result = await generateText({
+    model: input.model,
+    system: [
+      '你是一个“长期记忆提取器”。',
+      '根据用户本轮输入，提取最多 5 条值得长期记住的信息。',
+      '只记：稳定偏好、长期目标、固定事实、环境约束、明确的规则/禁忌。',
+      '不要记：一次性任务、临时数字、会过期的链接、敏感信息（API Key/Token/密码）。',
+      '只输出一个 JSON 对象：{"memories":[{"text":"...","tags":["preference|profile|constraint|goal|workflow"]}]}',
+      '如果没有值得记住的内容，输出：{"memories":[]}'
+    ].join('\n'),
+    prompt: text
+  });
+
+  const memories = parseMemoryCandidates(result.text);
+  for (const m of memories) {
+    await addMemory({ text: m.text, tags: m.tags });
+  }
 }
 
 /**
@@ -426,6 +487,8 @@ export async function POST(req: Request): Promise<Response> {
   try {
     const body = (await req.json().catch(() => ({}))) as { messages?: unknown };
     const messages = coerceMessages(body.messages);
+    const latestUser = [...messages].reverse().find((m) => m.role === 'user');
+    const relevantMemories = latestUser ? await searchMemories({ query: latestUser.content, limit: 6 }) : [];
 
     const { baseURL, apiKey, model } = getOpenAICompatibleConfig();
     if (!baseURL || !apiKey) {
@@ -444,9 +507,17 @@ export async function POST(req: Request): Promise<Response> {
       apiKey
     });
 
+    const chatModel = provider(model);
+
     const result = await generateText({
-      model: provider(model),
-      messages: [{ role: 'system', content: buildCanvasSystemPrompt() }, ...messages]
+      model: chatModel,
+      messages: [
+        { role: 'system', content: buildCanvasSystemPrompt() } as ModelMessage,
+        ...(relevantMemories.length
+          ? ([{ role: 'system', content: buildMemoryContextPrompt(relevantMemories) }] as ModelMessage[])
+          : []),
+        ...messages
+      ] as ModelMessage[]
     });
 
     const parsed = parseChatOutput(result.text);
@@ -455,9 +526,11 @@ export async function POST(req: Request): Promise<Response> {
       const text = parsed.replyText?.trim()
         ? `${parsed.replyText.trim()}\n${executed.text}`
         : executed.text;
+      if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
       return NextResponse.json({ output: { type: 'text', text } satisfies ChatOutput });
     }
 
+    if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
     return NextResponse.json({ output: parsed satisfies ChatOutput });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
