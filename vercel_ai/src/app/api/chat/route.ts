@@ -1,4 +1,4 @@
-import { generateText, type ModelMessage } from 'ai';
+import { generateText, jsonSchema, stepCountIs, tool, type ModelMessage } from 'ai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { NextResponse } from 'next/server';
 import { addMemory, searchMemories, type MemoryItem } from '../../../server/memoryStore';
@@ -38,11 +38,20 @@ type ParsedOutput = ChatOutput | ActionOutput;
 /**
  * 从环境变量读取 OpenAI-compatible 网关配置。
  */
-function getOpenAICompatibleConfig(): { baseURL: string; apiKey: string; model: string } {
-  const baseURL = (process.env.OPENAI_COMPATIBLE_BASE_URL ?? '').trim();
-  const apiKey = (process.env.OPENAI_COMPATIBLE_API_KEY ?? '').trim();
+function getOpenAICompatibleConfig(req: Request): { baseURL: string; apiKey: string; model: string } {
   const model = (process.env.OPENAI_COMPATIBLE_MODEL ?? 'gemini-2.5-pro').trim();
 
+  const envBaseURL = (process.env.OPENAI_COMPATIBLE_BASE_URL ?? '').trim();
+  const envApiKey = (process.env.OPENAI_COMPATIBLE_API_KEY ?? '').trim();
+  if (envBaseURL && envApiKey) return { baseURL: envBaseURL, apiKey: envApiKey, model };
+
+  const upstreamBaseURL = (process.env.AI_GATEWAY_BASE_URL ?? '').trim();
+  const upstreamApiKey = (process.env.AI_GATEWAY_API_KEY ?? '').trim();
+  if (!upstreamBaseURL || !upstreamApiKey) return { baseURL: '', apiKey: '', model };
+
+  const origin = new URL(req.url).origin;
+  const baseURL = `${origin}/api/gateway`;
+  const apiKey = (process.env.LOCAL_GATEWAY_API_KEY ?? 'local').trim() || 'local';
   return { baseURL, apiKey, model };
 }
 
@@ -144,13 +153,15 @@ function buildCanvasSystemPrompt(): string {
     '',
     '你必须只输出一个 JSON 对象（不要 Markdown，不要代码块，不要额外文本）。',
     '',
-    '输出格式三选一：',
+    '输出格式二选一：',
     '1) 纯文本：{"type":"text","text":"..."}',
     '2) Canvas：{"type":"canvas","canvas":{"title":"可选标题","html":"...","css":"可选","js":"可选","height":360,"allowNetwork":false}}',
-    '3) 动作（用于创建/管理定时器）：{"type":"action","action":{"name":"timer.create","timer":{"mode":"interval","everyMs":10000,"task":{"type":"notify","message":"你好"}}},"replyText":"可选：给用户的确认文案"}',
     '',
     '何时使用 Canvas：当用户需要数据可视化、筛选/排序、表单提交、缩放/切换视图等交互时，优先用 Canvas；否则用 text。',
-    '何时使用 action：当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先用 action。',
+    '',
+    '当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先通过工具调用完成：timer_create / timer_cancel / timer_list。',
+    '工具返回的结果视为事实；不要重复调用同一个工具来“确认”。',
+    '除非用户明确要求“查询/写入长期记忆”，否则不要调用 memory_search / memory_add。',
     '',
     'Canvas 约束：',
     '- 生成的 html/css/js 必须自包含，尽量不要依赖外部 CDN/网络请求。',
@@ -158,10 +169,6 @@ function buildCanvasSystemPrompt(): string {
     '- 不要读取/写入 cookies、localStorage、indexedDB；不要尝试访问父窗口 DOM。',
     '- 默认宽度自适应容器；高度建议 320~520（可通过 height 字段给出初始高度）。',
     '- 交互通过原生 HTML 表单/按钮/事件即可。',
-    '',
-    '定时器 action 约束：',
-    '- timer.create：mode=once 需要 runAt（毫秒时间戳）；mode=interval 需要 everyMs（毫秒），可选 startAt。',
-    '- task.type=notify 或 log；message 必须是简短字符串；data 可选。',
     '',
     '如果你无法生成 Canvas（例如缺少数据），请退回输出 type="text" 并说明需要什么输入。'
   ].join('\n');
@@ -490,12 +497,195 @@ export async function POST(req: Request): Promise<Response> {
     const latestUser = [...messages].reverse().find((m) => m.role === 'user');
     const relevantMemories = latestUser ? await searchMemories({ query: latestUser.content, limit: 6 }) : [];
 
-    const { baseURL, apiKey, model } = getOpenAICompatibleConfig();
+    const tools = {
+      timer_create: tool({
+        description: '创建一次性或周期性定时器（notify/log）。',
+        inputSchema: jsonSchema<TimerCreateInput>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              mode: { type: 'string', enum: ['once', 'interval'] },
+              runAt: { type: 'number' },
+              everyMs: { type: 'number' },
+              startAt: { type: 'number' },
+              task: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  type: { type: 'string', enum: ['notify', 'log'] },
+                  message: { type: 'string' },
+                  data: {}
+                },
+                required: ['type', 'message']
+              }
+            },
+            required: ['mode', 'task']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('timer_create 参数必须是对象') };
+              }
+              const v = value as Record<string, unknown>;
+              const mode = v.mode;
+              if (mode !== 'once' && mode !== 'interval') {
+                return { success: false, error: new Error('timer_create.mode 必须是 once 或 interval') };
+              }
+
+              const task = v.task;
+              if (!task || typeof task !== 'object' || Array.isArray(task)) {
+                return { success: false, error: new Error('timer_create.task 必须是对象') };
+              }
+              const taskObj = task as Record<string, unknown>;
+              const taskType = taskObj.type;
+              const message = taskObj.message;
+              if (taskType !== 'notify' && taskType !== 'log') {
+                return { success: false, error: new Error('timer_create.task.type 必须是 notify 或 log') };
+              }
+              if (typeof message !== 'string' || !message.trim()) {
+                return { success: false, error: new Error('timer_create.task.message 必须是非空字符串') };
+              }
+
+              const normalizedTask: TimerTask = taskObj.data === undefined
+                ? { type: taskType, message: message.trim() }
+                : { type: taskType, message: message.trim(), data: taskObj.data };
+
+              if (mode === 'once') {
+                const runAt = v.runAt;
+                if (typeof runAt !== 'number' || !Number.isFinite(runAt)) {
+                  return { success: false, error: new Error('timer_create.runAt 必须是有限数字') };
+                }
+                return { success: true, value: { mode: 'once', runAt, task: normalizedTask } };
+              }
+
+              const everyMs = v.everyMs;
+              if (typeof everyMs !== 'number' || !Number.isFinite(everyMs)) {
+                return { success: false, error: new Error('timer_create.everyMs 必须是有限数字') };
+              }
+              const startAt = v.startAt;
+              if (startAt !== undefined && (typeof startAt !== 'number' || !Number.isFinite(startAt))) {
+                return { success: false, error: new Error('timer_create.startAt 必须是有限数字') };
+              }
+              return {
+                success: true,
+                value: startAt === undefined
+                  ? { mode: 'interval', everyMs, task: normalizedTask }
+                  : { mode: 'interval', everyMs, startAt, task: normalizedTask }
+              };
+            }
+          }
+        ),
+        execute: async (input: TimerCreateInput) => executeTimerAction({ name: 'timer.create', timer: input })
+      }),
+      timer_cancel: tool({
+        description: '按 id 取消定时器。',
+        inputSchema: jsonSchema<{ id: string }>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: { id: { type: 'string' } },
+            required: ['id']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('timer_cancel 参数必须是对象') };
+              }
+              const id = (value as { id?: unknown }).id;
+              if (typeof id !== 'string' || !id.trim()) {
+                return { success: false, error: new Error('timer_cancel.id 必须是非空字符串') };
+              }
+              return { success: true, value: { id: id.trim() } };
+            }
+          }
+        ),
+        execute: async (input: { id: string }) => executeTimerAction({ name: 'timer.cancel', id: input.id })
+      }),
+      timer_list: tool({
+        description: '列出当前定时器数量（用于确认是否存在）。',
+        inputSchema: jsonSchema(() => ({ type: 'object', additionalProperties: false, properties: {} })),
+        execute: async () => executeTimerAction({ name: 'timer.list' })
+      }),
+      memory_search: tool({
+        description: '按 query 检索相关长期记忆条目。',
+        inputSchema: jsonSchema<{ query: string; limit?: number }>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              query: { type: 'string' },
+              limit: { type: 'number' }
+            },
+            required: ['query']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('memory_search 参数必须是对象') };
+              }
+              const v = value as { query?: unknown; limit?: unknown };
+              if (typeof v.query !== 'string' || !v.query.trim()) {
+                return { success: false, error: new Error('memory_search.query 必须是非空字符串') };
+              }
+              const limit = v.limit;
+              if (limit !== undefined && (typeof limit !== 'number' || !Number.isFinite(limit))) {
+                return { success: false, error: new Error('memory_search.limit 必须是有限数字') };
+              }
+              return {
+                success: true,
+                value: limit === undefined ? { query: v.query.trim() } : { query: v.query.trim(), limit }
+              };
+            }
+          }
+        ),
+        execute: async (input: { query: string; limit?: number }) => ({
+          memories: await searchMemories({ query: input.query, limit: input.limit })
+        })
+      }),
+      memory_add: tool({
+        description: '写入一条长期记忆（仅限稳定偏好/长期目标/固定事实/约束）。',
+        inputSchema: jsonSchema<{ text: string; tags?: string[] }>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              text: { type: 'string' },
+              tags: { type: 'array', items: { type: 'string' } }
+            },
+            required: ['text']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('memory_add 参数必须是对象') };
+              }
+              const v = value as { text?: unknown; tags?: unknown };
+              if (typeof v.text !== 'string' || !v.text.trim()) {
+                return { success: false, error: new Error('memory_add.text 必须是非空字符串') };
+              }
+              if (v.tags !== undefined) {
+                if (!Array.isArray(v.tags) || !v.tags.every((t) => typeof t === 'string' && t.trim())) {
+                  return { success: false, error: new Error('memory_add.tags 必须是字符串数组') };
+                }
+              }
+              const tags = Array.isArray(v.tags) ? v.tags.map((t) => t.trim()).filter(Boolean) : undefined;
+              return { success: true, value: tags?.length ? { text: v.text.trim(), tags } : { text: v.text.trim() } };
+            }
+          }
+        ),
+        execute: async (input: { text: string; tags?: string[] }) => ({
+          memory: await addMemory({ text: input.text, tags: input.tags })
+        })
+      })
+    };
+
+    const { baseURL, apiKey, model } = getOpenAICompatibleConfig(req);
     if (!baseURL || !apiKey) {
       return NextResponse.json(
         {
           error:
-            '缺少环境变量：OPENAI_COMPATIBLE_BASE_URL / OPENAI_COMPATIBLE_API_KEY（服务端运行时读取）'
+            '缺少环境变量：OPENAI_COMPATIBLE_BASE_URL / OPENAI_COMPATIBLE_API_KEY，或 AI_GATEWAY_BASE_URL / AI_GATEWAY_API_KEY（服务端运行时读取）'
         },
         { status: 500 }
       );
@@ -511,6 +701,8 @@ export async function POST(req: Request): Promise<Response> {
 
     const result = await generateText({
       model: chatModel,
+      tools,
+      stopWhen: stepCountIs(8),
       messages: [
         { role: 'system', content: buildCanvasSystemPrompt() } as ModelMessage,
         ...(relevantMemories.length
