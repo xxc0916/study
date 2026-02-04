@@ -1,0 +1,5 @@
+{
+  "name": "echo",
+  "description": "回显输入文本（用于调试 tool/skill 调用链路）。",
+  "entry": "run.mjs"
+}

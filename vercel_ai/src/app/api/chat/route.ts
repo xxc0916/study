@@ -2,6 +2,7 @@ import { generateText, jsonSchema, stepCountIs, tool, type ModelMessage } from '
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { NextResponse } from 'next/server';
 import { addMemory, searchMemories, type MemoryItem } from '../../../server/memoryStore';
+import { listSkills, loadSkillMarkdownByName, runSkillByName } from '../../../server/skillLoader';
 
 export const runtime = 'nodejs';
 
@@ -161,6 +162,8 @@ function buildCanvasSystemPrompt(): string {
     '',
     '当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先通过工具调用完成：timer_create / timer_cancel / timer_list。',
     '工具返回的结果视为事实；不要重复调用同一个工具来“确认”。',
+    '当用户明确要求“列出/加载/运行 skill”或请求你执行 calc/http_get/echo 等能力时，优先通过工具调用完成：skill_list / skill_load / skill_run。',
+    '当用户提出数学表达式计算（加减乘除/括号/小数）时，优先调用 skill_run 执行 calc，然后基于结果回复。',
     '除非用户明确要求“查询/写入长期记忆”，否则不要调用 memory_search / memory_add。',
     '',
     'Canvas 约束：',
@@ -247,6 +250,52 @@ function parseChatOutput(raw: string): ParsedOutput {
   } catch {
     return { type: 'text', text: raw };
   }
+}
+
+function extractUsedSkillNames(result: unknown): string[] {
+  const steps = (result as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return [];
+
+  const names: string[] = [];
+  for (const step of steps) {
+    const toolCalls = (step as { toolCalls?: unknown }).toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const call of toolCalls) {
+      const toolName = (call as { toolName?: unknown }).toolName;
+      if (toolName !== 'skill_run') continue;
+      const args = (call as { args?: unknown }).args;
+      const name = (args as { name?: unknown } | undefined)?.name;
+      if (typeof name === 'string' && name.trim()) names.push(name.trim());
+    }
+  }
+
+  return [...new Set(names)];
+}
+
+function appendUsedSkills(text: string, usedSkills: string[]): string {
+  if (!usedSkills.length) return text;
+  const footer = `（调用技能：${usedSkills.join(', ')}）`;
+  if (!text.trim()) return footer;
+  return `${text}\n\n${footer}`;
+}
+
+function extractPureCalcExpression(text: string): string | null {
+  const s = text.trim();
+  if (!s) return null;
+
+  const stripped = s
+    .replace(/^请\s*/g, '')
+    .replace(/^帮我\s*/g, '')
+    .replace(/^你\s*/g, '')
+    .replace(/^计算\s*/g, '')
+    .replace(/^算\s*/g, '')
+    .trim();
+
+  const candidate = stripped || s;
+  if (!/^[0-9+\-*/().\s]+$/.test(candidate)) return null;
+  if (!/[0-9]/.test(candidate)) return null;
+  if (!/[+\-*/]/.test(candidate)) return null;
+  return candidate.replace(/\s+/g, '');
 }
 
 /**
@@ -498,6 +547,62 @@ export async function POST(req: Request): Promise<Response> {
     const relevantMemories = latestUser ? await searchMemories({ query: latestUser.content, limit: 6 }) : [];
 
     const tools = {
+      skill_list: tool({
+        description: '列出当前可用 skills（来自本地 src/skills 目录）。',
+        inputSchema: jsonSchema(() => ({ type: 'object', additionalProperties: false, properties: {} })),
+        execute: async () => ({ skills: await listSkills() })
+      }),
+      skill_load: tool({
+        description: '加载指定 skill 的 SKILL.md 内容（不执行）。',
+        inputSchema: jsonSchema<{ name: string }>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: { name: { type: 'string' } },
+            required: ['name']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('skill_load 参数必须是对象') };
+              }
+              const name = (value as { name?: unknown }).name;
+              if (typeof name !== 'string' || !name.trim()) {
+                return { success: false, error: new Error('skill_load.name 必须是非空字符串') };
+              }
+              return { success: true, value: { name: name.trim() } };
+            }
+          }
+        ),
+        execute: async (input: { name: string }) => await loadSkillMarkdownByName(input.name)
+      }),
+      skill_run: tool({
+        description: '执行指定 skill（会返回 markdown + 执行结果）。',
+        inputSchema: jsonSchema<{ name: string; input?: unknown }>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              name: { type: 'string' },
+              input: {}
+            },
+            required: ['name']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('skill_run 参数必须是对象') };
+              }
+              const v = value as { name?: unknown; input?: unknown };
+              if (typeof v.name !== 'string' || !v.name.trim()) {
+                return { success: false, error: new Error('skill_run.name 必须是非空字符串') };
+              }
+              return { success: true, value: { name: v.name.trim(), input: v.input } };
+            }
+          }
+        ),
+        execute: async (input: { name: string; input?: unknown }) => await runSkillByName({ name: input.name, input: input.input })
+      }),
       timer_create: tool({
         description: '创建一次性或周期性定时器（notify/log）。',
         inputSchema: jsonSchema<TimerCreateInput>(
@@ -712,17 +817,36 @@ export async function POST(req: Request): Promise<Response> {
       ] as ModelMessage[]
     });
 
+    const usedSkills = extractUsedSkillNames(result);
     const parsed = parseChatOutput(result.text);
     if (parsed.type === 'action') {
       const executed = await executeTimerAction(parsed.action);
-      const text = parsed.replyText?.trim()
+      const text = appendUsedSkills(
+        parsed.replyText?.trim()
         ? `${parsed.replyText.trim()}\n${executed.text}`
-        : executed.text;
+        : executed.text,
+        usedSkills
+      );
       if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
       return NextResponse.json({ output: { type: 'text', text } satisfies ChatOutput });
     }
 
+    const autoExpr = latestUser ? extractPureCalcExpression(latestUser.content) : null;
+    if (!usedSkills.length && parsed.type === 'text' && autoExpr) {
+      const ran = await runSkillByName({ name: 'calc', input: { expr: autoExpr } });
+      const value = (ran.result as { value?: unknown } | undefined)?.value;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
+        return NextResponse.json({
+          output: { type: 'text', text: appendUsedSkills(String(value), ['calc']) } satisfies ChatOutput
+        });
+      }
+    }
+
     if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
+    if (parsed.type === 'text') {
+      return NextResponse.json({ output: { type: 'text', text: appendUsedSkills(parsed.text, usedSkills) } satisfies ChatOutput });
+    }
     return NextResponse.json({ output: parsed satisfies ChatOutput });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

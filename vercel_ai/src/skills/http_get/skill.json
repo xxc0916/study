@@ -1,0 +1,5 @@
+{
+  "name": "http_get",
+  "description": "通过服务端 fetch 拉取 URL 的文本预览（限制协议与长度）。",
+  "entry": "run.mjs"
+}
