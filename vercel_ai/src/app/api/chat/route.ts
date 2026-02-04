@@ -15,9 +15,35 @@ type CanvasPayload = {
   allowNetwork?: boolean;
 };
 
+type A2UIComponent = {
+  id: string;
+  type: string;
+  props?: Record<string, unknown>;
+};
+
+type A2UISurface = {
+  rootId: string;
+  components: A2UIComponent[];
+};
+
+type A2UIPayload = {
+  surface: A2UISurface;
+  model?: Record<string, unknown>;
+};
+
+type A2UIEvent = {
+  type: 'a2ui.event';
+  name?: string;
+  messageId?: string;
+  componentId?: string;
+  model?: Record<string, unknown>;
+  payload?: Record<string, unknown>;
+};
+
 type ChatOutput =
   | { type: 'text'; text: string }
-  | { type: 'canvas'; canvas: CanvasPayload };
+  | { type: 'canvas'; canvas: CanvasPayload }
+  | { type: 'a2ui'; a2ui: A2UIPayload };
 
 type TimerTask =
   | { type: 'notify'; message: string; data?: unknown }
@@ -146,25 +172,35 @@ async function autoRememberFromUserText(input: {
 }
 
 /**
- * 构建一段 system 指令，让模型在 “纯文本” 与 “Canvas 小应用” 之间自适配输出。
+ * 构建一段 system 指令，让模型在 “纯文本 / Canvas / A2UI” 三种输出之间自适配。
  */
-function buildCanvasSystemPrompt(): string {
+function buildChatSystemPrompt(): string {
   return [
-    '你是一个可在聊天界面中生成「Canvas（画布）」的 AI Agent。',
+    '你是一个可在聊天界面中生成「纯文本 / Canvas（画布）/ A2UI」的 AI Agent。',
     '',
     '你必须只输出一个 JSON 对象（不要 Markdown，不要代码块，不要额外文本）。',
     '',
-    '输出格式二选一：',
+    '输出格式三选一：',
     '1) 纯文本：{"type":"text","text":"..."}',
     '2) Canvas：{"type":"canvas","canvas":{"title":"可选标题","html":"...","css":"可选","js":"可选","height":360,"allowNetwork":false}}',
+    '3) A2UI：{"type":"a2ui","a2ui":{"surface":{"rootId":"root","components":[{"id":"root","type":"card","props":{"title":"标题","children":["c1"]}},{"id":"c1","type":"text","props":{"text":"内容"}}]},"model":{"field":"value"}}}',
     '',
-    '何时使用 Canvas：当用户需要数据可视化、筛选/排序、表单提交、缩放/切换视图等交互时，优先用 Canvas；否则用 text。',
+    '何时使用 A2UI：当用户需要“表单/按钮/列表”等原生交互，且不需要运行任意 JS 时，优先用 A2UI（更安全，支持结构化事件回传）。',
+    '何时使用 Canvas：当用户需要复杂自定义交互/可视化，必须运行自定义 JS 时，再使用 Canvas。',
     '',
     '当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先通过工具调用完成：timer_create / timer_cancel / timer_list。',
     '工具返回的结果视为事实；不要重复调用同一个工具来“确认”。',
     '当用户明确要求“列出/加载/运行 skill”或请求你执行 calc/http_get/echo 等能力时，优先通过工具调用完成：skill_list / skill_load / skill_run。',
     '当用户提出数学表达式计算（加减乘除/括号/小数）时，优先调用 skill_run 执行 calc，然后基于结果回复。',
     '除非用户明确要求“查询/写入长期记忆”，否则不要调用 memory_search / memory_add。',
+    '',
+    'A2UI 约束（客户端只会渲染白名单组件，未在白名单的 type 会被忽略或降级）：',
+    '- 组件采用扁平数组 + id 引用 children 的形式（LLM 友好）。',
+    '- 允许的 type：card / text / row / column / divider / text-field / select / button。',
+    '- text.props: {text:string}',
+    '- text-field.props: {label?:string, key:string, placeholder?:string}',
+    '- select.props: {label?:string, key:string, options:[{label:string,value:string}] }',
+    '- button.props: {label?:string, action?: "submit"|"click"}',
     '',
     'Canvas 约束：',
     '- 生成的 html/css/js 必须自包含，尽量不要依赖外部 CDN/网络请求。',
@@ -192,6 +228,133 @@ function extractJsonObjectText(raw: string): string | null {
   if (first !== -1 && last !== -1 && last > first) return trimmed.slice(first, last + 1).trim();
 
   return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * 将任意输入尽量标准化为 A2UI payload；失败则返回 null。
+ */
+function normalizeA2uiPayload(value: unknown): A2UIPayload | null {
+  if (!isRecord(value)) return null;
+  const surface = (value as { surface?: unknown }).surface;
+  if (!isRecord(surface)) return null;
+  const rootId = (surface as { rootId?: unknown }).rootId;
+  const components = (surface as { components?: unknown }).components;
+  if (typeof rootId !== 'string' || !rootId.trim()) return null;
+  if (!Array.isArray(components)) return null;
+
+  const normalizedComponents: A2UIComponent[] = [];
+  for (const c of components) {
+    if (!isRecord(c)) return null;
+    const id = (c as { id?: unknown }).id;
+    const type = (c as { type?: unknown }).type;
+    const props = (c as { props?: unknown }).props;
+    if (typeof id !== 'string' || !id.trim()) return null;
+    if (typeof type !== 'string' || !type.trim()) return null;
+    normalizedComponents.push({
+      id: id.trim(),
+      type: type.trim(),
+      props: isRecord(props) ? props : undefined
+    });
+  }
+
+  const model = (value as { model?: unknown }).model;
+  return {
+    surface: { rootId: rootId.trim(), components: normalizedComponents },
+    model: isRecord(model) ? model : undefined
+  };
+}
+
+/**
+ * 尝试从用户消息中解析 A2UI 事件（结构化 JSON），用于交互回传。
+ */
+function parseA2uiEventFromUserText(text: string): A2UIEvent | null {
+  const candidate = extractJsonObjectText(text);
+  if (!candidate) return null;
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    if (!isRecord(parsed)) return null;
+    if (parsed.type !== 'a2ui.event') return null;
+
+    const name = typeof parsed.name === 'string' ? parsed.name : undefined;
+    const messageId = typeof parsed.messageId === 'string' ? parsed.messageId : undefined;
+    const componentId = typeof parsed.componentId === 'string' ? parsed.componentId : undefined;
+    const model = isRecord(parsed.model) ? parsed.model : undefined;
+    const payload = isRecord(parsed.payload) ? parsed.payload : undefined;
+
+    return { type: 'a2ui.event', name, messageId, componentId, model, payload };
+  } catch {
+    return null;
+  }
+}
+
+function shouldReturnA2uiDemo(userText: string): boolean {
+  const t = userText.trim().toLowerCase();
+  if (!t) return false;
+  if (!t.includes('a2ui')) return false;
+  return t.includes('demo') || t.includes('演示') || t.includes('示例');
+}
+
+/**
+ * 生成一个最小可交互的 A2UI 卡片（用于快速验证前后端接入）。
+ */
+function buildA2uiDemoOutput(): ChatOutput {
+  const a2ui: A2UIPayload = {
+    surface: {
+      rootId: 'root',
+      components: [
+        {
+          id: 'root',
+          type: 'card',
+          props: { title: 'A2UI 演示：偏好收集', children: ['intro', 'name', 'color', 'actions'] }
+        },
+        { id: 'intro', type: 'text', props: { text: '在卡片里填写信息并点击“提交”。' } },
+        {
+          id: 'name',
+          type: 'text-field',
+          props: { label: '你的名字', key: 'name', placeholder: '例如：小明' }
+        },
+        {
+          id: 'color',
+          type: 'select',
+          props: {
+            label: '喜欢的颜色',
+            key: 'color',
+            options: [
+              { label: '蓝色', value: 'blue' },
+              { label: '红色', value: 'red' },
+              { label: '绿色', value: 'green' }
+            ]
+          }
+        },
+        { id: 'actions', type: 'row', props: { children: ['submit'] } },
+        { id: 'submit', type: 'button', props: { label: '提交', action: 'submit' } }
+      ]
+    },
+    model: { name: '', color: 'blue' }
+  };
+  return { type: 'a2ui', a2ui };
+}
+
+function buildA2uiEventReply(event: A2UIEvent): ChatOutput {
+  const name = typeof event.name === 'string' ? event.name : '';
+  const model = event.model && typeof event.model === 'object' ? event.model : undefined;
+  if (name === 'submit' && model) {
+    const n = typeof model.name === 'string' ? model.name.trim() : '';
+    const c = typeof model.color === 'string' ? model.color.trim() : '';
+    const parts = [`收到 A2UI 提交`];
+    if (n) parts.push(`name=${n}`);
+    if (c) parts.push(`color=${c}`);
+    return { type: 'text', text: parts.join('，') };
+  }
+  if (name === 'click') {
+    const cid = typeof event.componentId === 'string' ? event.componentId : '';
+    return { type: 'text', text: cid ? `收到 A2UI 点击：${cid}` : '收到 A2UI 点击事件' };
+  }
+  return { type: 'text', text: '收到 A2UI 事件' };
 }
 
 /**
@@ -236,6 +399,13 @@ function parseChatOutput(raw: string): ParsedOutput {
           allowNetwork: typeof allowNetwork === 'boolean' ? allowNetwork : undefined
         }
       };
+    }
+
+    if (type === 'a2ui') {
+      const a2ui = (parsed as { a2ui?: unknown }).a2ui;
+      const normalized = normalizeA2uiPayload(a2ui);
+      if (!normalized) return { type: 'text', text: raw };
+      return { type: 'a2ui', a2ui: normalized };
     }
 
     if (type === 'action') {
@@ -544,6 +714,14 @@ export async function POST(req: Request): Promise<Response> {
     const body = (await req.json().catch(() => ({}))) as { messages?: unknown };
     const messages = coerceMessages(body.messages);
     const latestUser = [...messages].reverse().find((m) => m.role === 'user');
+    if (latestUser) {
+      const event = parseA2uiEventFromUserText(latestUser.content);
+      if (event) return NextResponse.json({ output: buildA2uiEventReply(event) satisfies ChatOutput });
+      if (shouldReturnA2uiDemo(latestUser.content)) {
+        return NextResponse.json({ output: buildA2uiDemoOutput() satisfies ChatOutput });
+      }
+    }
+
     const relevantMemories = latestUser ? await searchMemories({ query: latestUser.content, limit: 6 }) : [];
 
     const tools = {
@@ -809,7 +987,7 @@ export async function POST(req: Request): Promise<Response> {
       tools,
       stopWhen: stepCountIs(8),
       messages: [
-        { role: 'system', content: buildCanvasSystemPrompt() } as ModelMessage,
+        { role: 'system', content: buildChatSystemPrompt() } as ModelMessage,
         ...(relevantMemories.length
           ? ([{ role: 'system', content: buildMemoryContextPrompt(relevantMemories) }] as ModelMessage[])
           : []),

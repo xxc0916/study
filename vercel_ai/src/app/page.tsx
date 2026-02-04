@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
 type CanvasPayload = {
   title?: string;
@@ -11,14 +11,42 @@ type CanvasPayload = {
   allowNetwork?: boolean;
 };
 
+type A2UIComponent = {
+  id: string;
+  type: string;
+  props?: Record<string, unknown>;
+};
+
+type A2UISurface = {
+  rootId: string;
+  components: A2UIComponent[];
+};
+
+type A2UIPayload = {
+  surface: A2UISurface;
+  model?: Record<string, unknown>;
+};
+
+type A2UIEvent = {
+  type: 'a2ui.event';
+  name: 'submit' | 'click';
+  messageId: string;
+  componentId?: string;
+  model?: Record<string, unknown>;
+  payload?: Record<string, unknown>;
+};
+
 type ChatOutput =
   | { type: 'text'; text: string }
-  | { type: 'canvas'; canvas: CanvasPayload };
+  | { type: 'canvas'; canvas: CanvasPayload }
+  | { type: 'a2ui'; a2ui: A2UIPayload };
 
 type ChatMessage =
   | { id: string; role: 'user'; kind: 'text'; text: string }
+  | { id: string; role: 'user'; kind: 'a2ui_event'; label: string; event: A2UIEvent }
   | { id: string; role: 'assistant'; kind: 'text'; text: string }
-  | { id: string; role: 'assistant'; kind: 'canvas'; canvas: CanvasPayload };
+  | { id: string; role: 'assistant'; kind: 'canvas'; canvas: CanvasPayload }
+  | { id: string; role: 'assistant'; kind: 'a2ui'; a2ui: A2UIPayload };
 
 type TimerFiredMessage = {
   type: 'timer.fired';
@@ -56,8 +84,12 @@ function extractNotifyTextFromTimerEvent(event: unknown): string | null {
 function toApiMessages(messages: ChatMessage[]): Array<{ role: 'user' | 'assistant'; content: string }> {
   return messages.map((m) => {
     if (m.kind === 'text') return { role: m.role, content: m.text };
-    const title = m.canvas.title ? `《${m.canvas.title}》` : '';
-    return { role: m.role, content: `[Canvas${title}]` };
+    if (m.kind === 'a2ui_event') return { role: m.role, content: JSON.stringify(m.event) };
+    if (m.kind === 'canvas') {
+      const title = m.canvas.title ? `《${m.canvas.title}》` : '';
+      return { role: m.role, content: `[Canvas${title}]` };
+    }
+    return { role: m.role, content: JSON.stringify({ type: 'a2ui', a2ui: m.a2ui }) };
   });
 }
 
@@ -204,6 +236,259 @@ function CanvasCard({ canvas }: { canvas: CanvasPayload }) {
   );
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function readStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const strings = value.filter((v): v is string => typeof v === 'string');
+  return strings.length === value.length ? strings : null;
+}
+
+function readSelectOptions(
+  value: unknown
+): Array<{ label: string; value: string }> | null {
+  if (!Array.isArray(value)) return null;
+  const out: Array<{ label: string; value: string }> = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    const label = readString(item.label);
+    const v = readString(item.value);
+    if (!label || !v) return null;
+    out.push({ label, value: v });
+  }
+  return out;
+}
+
+function coerceModelToStringMap(model: unknown): Record<string, string> {
+  if (!isRecord(model)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(model)) {
+    if (typeof v === 'string') out[k] = v;
+    else if (typeof v === 'number' && Number.isFinite(v)) out[k] = String(v);
+    else if (typeof v === 'boolean') out[k] = v ? 'true' : 'false';
+  }
+  return out;
+}
+
+/**
+ * 渲染 A2UI payload：仅允许渲染本地白名单组件（安全像数据、表达像组件）。
+ */
+function A2UICard(input: {
+  a2ui: A2UIPayload;
+  model: Record<string, string>;
+  onModelChange: (key: string, value: string) => void;
+  onEvent: (event: Omit<A2UIEvent, 'type' | 'messageId' | 'model'>) => void;
+}) {
+  const { a2ui, model, onModelChange, onEvent } = input;
+  const componentById = useMemo(() => {
+    const map = new Map<string, A2UIComponent>();
+    for (const c of a2ui.surface.components) map.set(c.id, c);
+    return map;
+  }, [a2ui.surface.components]);
+
+  const rendered = new Set<string>();
+
+  function renderNode(nodeId: string): ReactNode {
+    if (rendered.has(nodeId)) return null;
+    rendered.add(nodeId);
+
+    const node = componentById.get(nodeId);
+    if (!node) return null;
+
+    const props = isRecord(node.props) ? node.props : {};
+
+    if (node.type === 'card') {
+      const title = readString(props.title);
+      const children = readStringArray(props.children) ?? [];
+      return (
+        <div style={{ border: '1px solid #e5e7eb', borderRadius: 10, overflow: 'hidden' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '10px 12px',
+              background: '#f9fafb',
+              borderBottom: children.length ? '1px solid #e5e7eb' : 'none'
+            }}
+          >
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div style={{ fontSize: 12, color: '#6b7280' }}>A2UI</div>
+              {title ? <div style={{ fontSize: 13 }}>{title}</div> : null}
+            </div>
+          </div>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {children.map((cid) => (
+              <div key={cid}>{renderNode(cid)}</div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    if (node.type === 'column') {
+      const children = readStringArray(props.children) ?? [];
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {children.map((cid) => (
+            <div key={cid}>{renderNode(cid)}</div>
+          ))}
+        </div>
+      );
+    }
+
+    if (node.type === 'row') {
+      const children = readStringArray(props.children) ?? [];
+      return (
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          {children.map((cid) => (
+            <div key={cid}>{renderNode(cid)}</div>
+          ))}
+        </div>
+      );
+    }
+
+    if (node.type === 'divider') {
+      return <hr style={{ border: 0, borderTop: '1px solid #e5e7eb' }} />;
+    }
+
+    if (node.type === 'text') {
+      const text = readString(props.text) ?? '';
+      return <div style={{ whiteSpace: 'pre-wrap' }}>{text}</div>;
+    }
+
+    if (node.type === 'text-field') {
+      const label = readString(props.label) ?? '';
+      const key = readString(props.key) ?? '';
+      const placeholder = readString(props.placeholder) ?? undefined;
+      if (!key) return null;
+
+      return (
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {label ? <div style={{ fontSize: 12, color: '#6b7280' }}>{label}</div> : null}
+          <input
+            value={model[key] ?? ''}
+            onChange={(e) => onModelChange(key, e.target.value)}
+            placeholder={placeholder}
+            style={{
+              border: '1px solid #e5e7eb',
+              borderRadius: 8,
+              padding: '10px 12px'
+            }}
+          />
+        </label>
+      );
+    }
+
+    if (node.type === 'select') {
+      const label = readString(props.label) ?? '';
+      const key = readString(props.key) ?? '';
+      const options = readSelectOptions(props.options) ?? [];
+      if (!key || options.length === 0) return null;
+      const value = model[key] ?? options[0]?.value ?? '';
+
+      return (
+        <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {label ? <div style={{ fontSize: 12, color: '#6b7280' }}>{label}</div> : null}
+          <select
+            value={value}
+            onChange={(e) => onModelChange(key, e.target.value)}
+            style={{
+              border: '1px solid #e5e7eb',
+              borderRadius: 8,
+              padding: '10px 12px',
+              background: '#fff'
+            }}
+          >
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      );
+    }
+
+    if (node.type === 'button') {
+      const label = readString(props.label) ?? '按钮';
+      const action = readString(props.action) ?? 'click';
+      return (
+        <button
+          type="button"
+          onClick={() => onEvent({ name: action === 'submit' ? 'submit' : 'click', componentId: node.id })}
+          style={{
+            padding: '10px 14px',
+            borderRadius: 8,
+            border: '1px solid #e5e7eb',
+            background: '#111827',
+            color: '#fff',
+            cursor: 'pointer'
+          }}
+        >
+          {label}
+        </button>
+      );
+    }
+
+    return (
+      <div style={{ padding: 10, border: '1px dashed #d1d5db', borderRadius: 10, color: '#6b7280' }}>
+        未支持的组件：{node.type}
+      </div>
+    );
+  }
+
+  const rootId = a2ui.surface.rootId;
+  const root = renderNode(rootId);
+  if (!root) {
+    return (
+      <div style={{ padding: 10, border: '1px dashed #d1d5db', borderRadius: 10, color: '#6b7280' }}>
+        A2UI 渲染失败：找不到 rootId={rootId}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {root}
+      <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+        <button
+          type="button"
+          onClick={() => onEvent({ name: 'submit' })}
+          style={{
+            padding: '10px 14px',
+            borderRadius: 8,
+            border: '1px solid #e5e7eb',
+            background: '#fff',
+            cursor: 'pointer'
+          }}
+        >
+          提交当前表单
+        </button>
+        <button
+          type="button"
+          onClick={() => onEvent({ name: 'click' })}
+          style={{
+            padding: '10px 14px',
+            borderRadius: 8,
+            border: '1px solid #e5e7eb',
+            background: '#fff',
+            cursor: 'pointer'
+          }}
+        >
+          发送点击事件
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /**
  * 首页：用最小 UI 调用 /api/chat，实现“接口对话”演示。
  */
@@ -211,6 +496,7 @@ export default function Page() {
   const [input, setInput] = useState('你好');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  const [a2uiModels, setA2uiModels] = useState<Record<string, Record<string, string>>>({});
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
 
   /**
@@ -262,13 +548,12 @@ export default function Page() {
   /**
    * 发送消息：把历史消息 + 新消息发到服务端，再把模型回复追加到列表里。
    */
-  async function handleSend(): Promise<void> {
-    if (!canSend) return;
+  async function sendMessage(userMessage: ChatMessage): Promise<void> {
+    if (loading) return;
 
-    const userMessage: ChatMessage = { id: createMessageId(), role: 'user', kind: 'text', text: input.trim() };
     const nextMessages = [...messages, userMessage];
     setMessages(nextMessages);
-    setInput('');
+    if (userMessage.kind === 'text') setInput('');
     setLoading(true);
 
     try {
@@ -291,6 +576,13 @@ export default function Page() {
         return;
       }
 
+      if (output.type === 'a2ui') {
+        const id = createMessageId();
+        setA2uiModels((prev) => ({ ...prev, [id]: coerceModelToStringMap(output.a2ui.model) }));
+        setMessages((prev) => [...prev, { id, role: 'assistant', kind: 'a2ui', a2ui: output.a2ui }]);
+        return;
+      }
+
       setMessages((prev) => [
         ...prev,
         { id: createMessageId(), role: 'assistant', kind: 'text', text: output.text }
@@ -304,6 +596,27 @@ export default function Page() {
     } finally {
       setLoading(false);
     }
+  }
+
+  /**
+   * 由输入框触发的“发送”动作。
+   */
+  async function handleSend(): Promise<void> {
+    if (!canSend) return;
+    const text = input.trim();
+    if (!text) return;
+    await sendMessage({ id: createMessageId(), role: 'user', kind: 'text', text });
+  }
+
+  /**
+   * 由 A2UI 卡片触发的事件回传：以结构化 JSON 发送到后端。
+   */
+  async function handleA2uiEvent(input: { messageId: string; event: Omit<A2UIEvent, 'type' | 'messageId' | 'model'> }) {
+    if (loading) return;
+    const model = a2uiModels[input.messageId] ?? {};
+    const event: A2UIEvent = { type: 'a2ui.event', messageId: input.messageId, model, ...input.event };
+    const label = event.name === 'submit' ? '（通过 A2UI 提交）' : '（通过 A2UI 点击）';
+    await sendMessage({ id: createMessageId(), role: 'user', kind: 'a2ui_event', label, event });
   }
 
   return (
@@ -332,6 +645,19 @@ export default function Page() {
                 <div style={{ marginTop: 6 }}>
                   <CanvasCard canvas={m.canvas} />
                 </div>
+              ) : m.kind === 'a2ui' ? (
+                <div style={{ marginTop: 6 }}>
+                  <A2UICard
+                    a2ui={m.a2ui}
+                    model={a2uiModels[m.id] ?? coerceModelToStringMap(m.a2ui.model)}
+                    onModelChange={(key, value) =>
+                      setA2uiModels((prev) => ({ ...prev, [m.id]: { ...(prev[m.id] ?? {}), [key]: value } }))
+                    }
+                    onEvent={(event) => void handleA2uiEvent({ messageId: m.id, event })}
+                  />
+                </div>
+              ) : m.kind === 'a2ui_event' ? (
+                <div style={{ whiteSpace: 'pre-wrap' }}>{m.label}</div>
               ) : (
                 <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
               )}
