@@ -36,6 +36,10 @@ type A2UIEvent = {
   payload?: Record<string, unknown>;
 };
 
+type ChatMeta = {
+  usedCalls?: string[];
+};
+
 type ChatOutput =
   | { type: 'text'; text: string }
   | { type: 'canvas'; canvas: CanvasPayload }
@@ -44,9 +48,9 @@ type ChatOutput =
 type ChatMessage =
   | { id: string; role: 'user'; kind: 'text'; text: string }
   | { id: string; role: 'user'; kind: 'a2ui_event'; label: string; event: A2UIEvent }
-  | { id: string; role: 'assistant'; kind: 'text'; text: string }
-  | { id: string; role: 'assistant'; kind: 'canvas'; canvas: CanvasPayload }
-  | { id: string; role: 'assistant'; kind: 'a2ui'; a2ui: A2UIPayload };
+  | { id: string; role: 'assistant'; kind: 'text'; text: string; meta?: ChatMeta }
+  | { id: string; role: 'assistant'; kind: 'canvas'; canvas: CanvasPayload; meta?: ChatMeta }
+  | { id: string; role: 'assistant'; kind: 'a2ui'; a2ui: A2UIPayload; meta?: ChatMeta };
 
 type TimerFiredMessage = {
   type: 'timer.fired';
@@ -563,15 +567,16 @@ export default function Page() {
         body: JSON.stringify({ messages: toApiMessages(nextMessages) })
       });
 
-      const data = (await res.json().catch(() => ({}))) as { output?: ChatOutput; error?: string };
+      const data = (await res.json().catch(() => ({}))) as { output?: ChatOutput; meta?: ChatMeta; error?: string };
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       if (!data.output) throw new Error('接口返回缺少 output 字段');
       const output = data.output;
+      const meta = data.meta;
 
       if (output.type === 'canvas') {
         setMessages((prev) => [
           ...prev,
-          { id: createMessageId(), role: 'assistant', kind: 'canvas', canvas: output.canvas }
+          { id: createMessageId(), role: 'assistant', kind: 'canvas', canvas: output.canvas, meta }
         ]);
         return;
       }
@@ -579,13 +584,13 @@ export default function Page() {
       if (output.type === 'a2ui') {
         const id = createMessageId();
         setA2uiModels((prev) => ({ ...prev, [id]: coerceModelToStringMap(output.a2ui.model) }));
-        setMessages((prev) => [...prev, { id, role: 'assistant', kind: 'a2ui', a2ui: output.a2ui }]);
+        setMessages((prev) => [...prev, { id, role: 'assistant', kind: 'a2ui', a2ui: output.a2ui, meta }]);
         return;
       }
 
       setMessages((prev) => [
         ...prev,
-        { id: createMessageId(), role: 'assistant', kind: 'text', text: output.text }
+        { id: createMessageId(), role: 'assistant', kind: 'text', text: output.text, meta }
       ]);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -661,6 +666,11 @@ export default function Page() {
               ) : (
                 <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
               )}
+              {m.role === 'assistant' && m.meta?.usedCalls?.length ? (
+                <div style={{ marginTop: 6, fontSize: 12, color: '#6b7280' }}>
+                  调用：{m.meta.usedCalls.join(', ')}
+                </div>
+              ) : null}
             </div>
           ))
         )}

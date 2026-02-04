@@ -1,0 +1,5 @@
+{
+  "name": "weather_query",
+  "description": "模拟查询指定城市和日期的天气。输入地址和日期，输出天气情况。",
+  "entry": "run.mjs"
+}

@@ -1,10 +1,16 @@
 import { generateText, jsonSchema, stepCountIs, tool, type ModelMessage } from 'ai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { NextResponse } from 'next/server';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { addMemory, searchMemories, type MemoryItem } from '../../../server/memoryStore';
 import { listSkills, loadSkillMarkdownByName, runSkillByName } from '../../../server/skillLoader';
 
 export const runtime = 'nodejs';
+
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const skillsRoot = path.join(moduleDir, '..', '..', '..', 'skills');
 
 type CanvasPayload = {
   title?: string;
@@ -61,6 +67,18 @@ type TimerAction =
 type ActionOutput = { type: 'action'; action: TimerAction; replyText?: string };
 
 type ParsedOutput = ChatOutput | ActionOutput;
+
+type SkillCreateInput = {
+  name: string;
+  description: string;
+  markdown?: string;
+  entryCode: string;
+  overwrite?: boolean;
+};
+
+type ChatMeta = {
+  usedCalls: string[];
+};
 
 /**
  * 从环境变量读取 OpenAI-compatible 网关配置。
@@ -191,8 +209,14 @@ function buildChatSystemPrompt(): string {
     '当用户明确提出“定时/每隔/到点提醒/周期执行/取消定时器/查看定时器”等需求时，优先通过工具调用完成：timer_create / timer_cancel / timer_list。',
     '工具返回的结果视为事实；不要重复调用同一个工具来“确认”。',
     '当用户明确要求“列出/加载/运行 skill”或请求你执行 calc/http_get/echo 等能力时，优先通过工具调用完成：skill_list / skill_load / skill_run。',
+    '当用户明确要求“创建/生成一个新 skill（技能）”时，优先通过工具调用完成：skill_create。创建成功后，提示用户可以继续 skill_run 来执行。',
     '当用户提出数学表达式计算（加减乘除/括号/小数）时，优先调用 skill_run 执行 calc，然后基于结果回复。',
     '除非用户明确要求“查询/写入长期记忆”，否则不要调用 memory_search / memory_add。',
+    '',
+    '当用户消息包含 A2UI_EVENT（例如：A2UI_EVENT={...}）时：',
+    '- 把它当作“用户在表单里填写并点击提交/按钮”的结果。',
+    '- 从 event.model 读取字段（如 city/address/date 等），继续完成用户请求。',
+    '- 如果可以用已有 skill 解决（例如天气/网页抓取/计算），优先调用 skill_run。',
     '',
     'A2UI 约束（客户端只会渲染白名单组件，未在白名单的 type 会被忽略或降级）：',
     '- 组件采用扁平数组 + id 引用 children 的形式（LLM 友好）。',
@@ -232,6 +256,69 @@ function extractJsonObjectText(raw: string): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * 校验并标准化 skill 名称，避免路径穿越等问题。
+ */
+function normalizeSkillName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error('skill_create.name 不能为空');
+  if (!/^[a-z0-9_]+$/.test(trimmed)) throw new Error('skill_create.name 只能包含小写字母/数字/下划线');
+  return trimmed;
+}
+
+/**
+ * 尝试对入口代码做最小校验，避免创建出不可运行的 skill。
+ */
+function validateEntryCode(code: string): void {
+  if (typeof code !== 'string' || !code.trim()) throw new Error('skill_create.entryCode 不能为空');
+  if (code.length > 40_000) throw new Error('skill_create.entryCode 过长（最多 40000 字符）');
+  const hasRunExport =
+    /export\s+(?:async\s+)?function\s+run\s*\(/.test(code) ||
+    /export\s+const\s+run\s*=\s*(?:async\s*)?\(/.test(code) ||
+    /export\s*\{\s*run\s*\}/.test(code);
+  if (!hasRunExport) throw new Error('skill_create.entryCode 必须导出 run（例如：export async function run(input) { ... }）');
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function createSkillOnDisk(input: SkillCreateInput): Promise<{ name: string; description: string }> {
+  const name = normalizeSkillName(input.name);
+  const description = input.description?.trim();
+  if (!description) throw new Error('skill_create.description 不能为空');
+  validateEntryCode(input.entryCode);
+
+  const dir = path.join(skillsRoot, name);
+  const exists = await pathExists(dir);
+  if (exists && !input.overwrite) throw new Error(`skill 已存在：${name}（如需覆盖请传 overwrite=true）`);
+
+  await fs.mkdir(dir, { recursive: true });
+
+  const manifest = {
+    name,
+    description,
+    entry: 'run.mjs'
+  };
+  const skillJson = `${JSON.stringify(manifest, null, 2)}\n`;
+  await fs.writeFile(path.join(dir, 'skill.json'), skillJson, 'utf8');
+
+  const md = (input.markdown?.trim()
+    ? input.markdown.trim()
+    : `# ${name}\n\n用途：${description}\n\n输入：\n- 由 run(input) 自行定义\n\n输出：\n- 由 run(input) 返回值决定\n`) + '\n';
+  await fs.writeFile(path.join(dir, 'SKILL.md'), md, 'utf8');
+
+  const code = input.entryCode.trimEnd() + '\n';
+  await fs.writeFile(path.join(dir, 'run.mjs'), code, 'utf8');
+
+  return { name, description };
 }
 
 /**
@@ -339,24 +426,6 @@ function buildA2uiDemoOutput(): ChatOutput {
   return { type: 'a2ui', a2ui };
 }
 
-function buildA2uiEventReply(event: A2UIEvent): ChatOutput {
-  const name = typeof event.name === 'string' ? event.name : '';
-  const model = event.model && typeof event.model === 'object' ? event.model : undefined;
-  if (name === 'submit' && model) {
-    const n = typeof model.name === 'string' ? model.name.trim() : '';
-    const c = typeof model.color === 'string' ? model.color.trim() : '';
-    const parts = [`收到 A2UI 提交`];
-    if (n) parts.push(`name=${n}`);
-    if (c) parts.push(`color=${c}`);
-    return { type: 'text', text: parts.join('，') };
-  }
-  if (name === 'click') {
-    const cid = typeof event.componentId === 'string' ? event.componentId : '';
-    return { type: 'text', text: cid ? `收到 A2UI 点击：${cid}` : '收到 A2UI 点击事件' };
-  }
-  return { type: 'text', text: '收到 A2UI 事件' };
-}
-
 /**
  * 尝试把模型输出解析成 ChatOutput；失败则回退为纯文本。
  */
@@ -433,7 +502,7 @@ function extractUsedSkillNames(result: unknown): string[] {
     for (const call of toolCalls) {
       const toolName = (call as { toolName?: unknown }).toolName;
       if (toolName !== 'skill_run') continue;
-      const args = (call as { args?: unknown }).args;
+      const args = coerceToolCallArgs((call as { args?: unknown }).args);
       const name = (args as { name?: unknown } | undefined)?.name;
       if (typeof name === 'string' && name.trim()) names.push(name.trim());
     }
@@ -442,11 +511,49 @@ function extractUsedSkillNames(result: unknown): string[] {
   return [...new Set(names)];
 }
 
-function appendUsedSkills(text: string, usedSkills: string[]): string {
-  if (!usedSkills.length) return text;
-  const footer = `（调用技能：${usedSkills.join(', ')}）`;
-  if (!text.trim()) return footer;
-  return `${text}\n\n${footer}`;
+/**
+ * 将 toolCall.args 尽量标准化为对象（AI SDK 可能返回对象或 JSON 字符串）。
+ */
+function coerceToolCallArgs(args: unknown): Record<string, unknown> | null {
+  if (args && typeof args === 'object' && !Array.isArray(args)) return args as Record<string, unknown>;
+  if (typeof args !== 'string' || !args.trim()) return null;
+  try {
+    const parsed: unknown = JSON.parse(args);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 从模型 steps 中提取本轮调用了哪些 tools/skills，便于前端展示。
+ */
+function extractChatMeta(result: unknown): ChatMeta {
+  const steps = (result as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return { usedCalls: [] };
+
+  const calls: string[] = [];
+  for (const step of steps) {
+    const toolCalls = (step as { toolCalls?: unknown }).toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const call of toolCalls) {
+      const toolName = (call as { toolName?: unknown }).toolName;
+      if (typeof toolName !== 'string' || !toolName.trim()) continue;
+
+      const args = coerceToolCallArgs((call as { args?: unknown }).args);
+      if (toolName === 'skill_run' || toolName === 'skill_create' || toolName === 'skill_load') {
+        const name = (args as { name?: unknown } | undefined)?.name;
+        if (typeof name === 'string' && name.trim()) {
+          calls.push(`${toolName}:${name.trim()}`);
+          continue;
+        }
+      }
+
+      calls.push(toolName.trim());
+    }
+  }
+
+  return { usedCalls: [...new Set(calls)] };
 }
 
 function extractPureCalcExpression(text: string): string | null {
@@ -712,13 +819,23 @@ async function executeTimerAction(action: TimerAction): Promise<{ ok: boolean; t
 export async function POST(req: Request): Promise<Response> {
   try {
     const body = (await req.json().catch(() => ({}))) as { messages?: unknown };
-    const messages = coerceMessages(body.messages);
-    const latestUser = [...messages].reverse().find((m) => m.role === 'user');
+    let messages = coerceMessages(body.messages);
+    let latestUserIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'user') {
+        latestUserIndex = i;
+        break;
+      }
+    }
+    const latestUser = latestUserIndex >= 0 ? messages[latestUserIndex] : undefined;
+    if (latestUser && shouldReturnA2uiDemo(latestUser.content)) {
+      return NextResponse.json({ output: buildA2uiDemoOutput() satisfies ChatOutput });
+    }
     if (latestUser) {
       const event = parseA2uiEventFromUserText(latestUser.content);
-      if (event) return NextResponse.json({ output: buildA2uiEventReply(event) satisfies ChatOutput });
-      if (shouldReturnA2uiDemo(latestUser.content)) {
-        return NextResponse.json({ output: buildA2uiDemoOutput() satisfies ChatOutput });
+      if (event) {
+        const normalized = `A2UI_EVENT=${JSON.stringify(event)}\n请根据 event.model 的字段继续完成用户请求。`;
+        messages = messages.map((m, idx) => (idx === latestUserIndex ? { role: 'user', content: normalized } : m));
       }
     }
 
@@ -729,6 +846,52 @@ export async function POST(req: Request): Promise<Response> {
         description: '列出当前可用 skills（来自本地 src/skills 目录）。',
         inputSchema: jsonSchema(() => ({ type: 'object', additionalProperties: false, properties: {} })),
         execute: async () => ({ skills: await listSkills() })
+      }),
+      skill_create: tool({
+        description:
+          '创建一个新的本地 skill（写入 src/skills/<name>/{skill.json,SKILL.md,run.mjs}）。run.mjs 必须导出 async function run(input) 并返回可 JSON 序列化的结果。',
+        inputSchema: jsonSchema<SkillCreateInput>(
+          () => ({
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              name: { type: 'string' },
+              description: { type: 'string' },
+              markdown: { type: 'string' },
+              entryCode: { type: 'string' },
+              overwrite: { type: 'boolean' }
+            },
+            required: ['name', 'description', 'entryCode']
+          }),
+          {
+            validate: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                return { success: false, error: new Error('skill_create 参数必须是对象') };
+              }
+              const v = value as Record<string, unknown>;
+              if (typeof v.name !== 'string') return { success: false, error: new Error('skill_create.name 必须是字符串') };
+              if (typeof v.description !== 'string') return { success: false, error: new Error('skill_create.description 必须是字符串') };
+              if (typeof v.entryCode !== 'string') return { success: false, error: new Error('skill_create.entryCode 必须是字符串') };
+              if (v.markdown !== undefined && typeof v.markdown !== 'string') {
+                return { success: false, error: new Error('skill_create.markdown 必须是字符串') };
+              }
+              if (v.overwrite !== undefined && typeof v.overwrite !== 'boolean') {
+                return { success: false, error: new Error('skill_create.overwrite 必须是布尔值') };
+              }
+              return {
+                success: true,
+                value: {
+                  name: String(v.name),
+                  description: String(v.description),
+                  markdown: v.markdown === undefined ? undefined : String(v.markdown),
+                  entryCode: String(v.entryCode),
+                  overwrite: v.overwrite === undefined ? undefined : Boolean(v.overwrite)
+                }
+              };
+            }
+          }
+        ),
+        execute: async (input: SkillCreateInput) => ({ skill: await createSkillOnDisk(input) })
       }),
       skill_load: tool({
         description: '加载指定 skill 的 SKILL.md 内容（不执行）。',
@@ -995,18 +1158,16 @@ export async function POST(req: Request): Promise<Response> {
       ] as ModelMessage[]
     });
 
+    const meta = extractChatMeta(result);
     const usedSkills = extractUsedSkillNames(result);
     const parsed = parseChatOutput(result.text);
     if (parsed.type === 'action') {
       const executed = await executeTimerAction(parsed.action);
-      const text = appendUsedSkills(
-        parsed.replyText?.trim()
+      const text = parsed.replyText?.trim()
         ? `${parsed.replyText.trim()}\n${executed.text}`
-        : executed.text,
-        usedSkills
-      );
+        : executed.text;
       if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
-      return NextResponse.json({ output: { type: 'text', text } satisfies ChatOutput });
+      return NextResponse.json({ output: { type: 'text', text } satisfies ChatOutput, meta });
     }
 
     const autoExpr = latestUser ? extractPureCalcExpression(latestUser.content) : null;
@@ -1015,17 +1176,19 @@ export async function POST(req: Request): Promise<Response> {
       const value = (ran.result as { value?: unknown } | undefined)?.value;
       if (typeof value === 'number' && Number.isFinite(value)) {
         if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
+        const nextMeta: ChatMeta = { usedCalls: [...new Set([...meta.usedCalls, 'skill_run:calc'])] };
         return NextResponse.json({
-          output: { type: 'text', text: appendUsedSkills(String(value), ['calc']) } satisfies ChatOutput
+          output: { type: 'text', text: String(value) } satisfies ChatOutput,
+          meta: nextMeta
         });
       }
     }
 
     if (latestUser) await autoRememberFromUserText({ model: chatModel, userText: latestUser.content });
     if (parsed.type === 'text') {
-      return NextResponse.json({ output: { type: 'text', text: appendUsedSkills(parsed.text, usedSkills) } satisfies ChatOutput });
+      return NextResponse.json({ output: { type: 'text', text: parsed.text } satisfies ChatOutput, meta });
     }
-    return NextResponse.json({ output: parsed satisfies ChatOutput });
+    return NextResponse.json({ output: parsed satisfies ChatOutput, meta });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: message }, { status: 500 });
